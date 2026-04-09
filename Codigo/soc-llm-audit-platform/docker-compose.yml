@@ -1,0 +1,100 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL 16 con pgcrypto ──
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-soc_llm_audit}
+      POSTGRES_USER: ${POSTGRES_USER:-soc_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-S0c_Adm1n_2026!}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis (cache + sessions + rate limiting) ──
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD:-R3d1s_S0C_2026!}
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-R3d1s_S0C_2026!}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Zookeeper (Kafka dependency) ──
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  # ── Apache Kafka ──
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ── Backend (FastAPI) ──
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-soc_admin}:${POSTGRES_PASSWORD:-S0c_Adm1n_2026!}@postgres:5432/${POSTGRES_DB:-soc_llm_audit}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-R3d1s_S0C_2026!}@redis:6379/0
+      REDIS_SESSION_URL: redis://:${REDIS_PASSWORD:-R3d1s_S0C_2026!}@redis:6379/1
+      REDIS_RATE_LIMIT_URL: redis://:${REDIS_PASSWORD:-R3d1s_S0C_2026!}@redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-ch4ng3_th1s_jwt_s3cr3t_k3y_2026}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-ch4ng3_th1s_3ncrypt10n_k3y_2026}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Frontend (React + Nginx) ──
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:

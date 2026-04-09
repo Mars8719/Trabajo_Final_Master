@@ -1,0 +1,148 @@
+name: SOC-LLM Audit Platform CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+
+jobs:
+  # ── Backend Tests ──
+  backend-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: soc_llm_audit_test
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_pass
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          pip install -r requirements.txt
+          python -m spacy download es_core_news_sm || true
+
+      - name: Run GDPR tests
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_pass@localhost:5432/soc_llm_audit_test
+          REDIS_URL: redis://localhost:6379/0
+        run: pytest tests/test_gdpr.py -v --tb=short
+
+      - name: Run NIS2 tests
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_pass@localhost:5432/soc_llm_audit_test
+          REDIS_URL: redis://localhost:6379/0
+        run: pytest tests/test_nis2.py -v --tb=short
+
+      - name: Run LLM Security tests (OWASP)
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_pass@localhost:5432/soc_llm_audit_test
+          REDIS_URL: redis://localhost:6379/0
+        run: pytest tests/test_llm_security.py -v --tb=short
+
+      - name: Run Ethics / Bias tests
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_pass@localhost:5432/soc_llm_audit_test
+          REDIS_URL: redis://localhost:6379/0
+        run: pytest tests/test_ethics.py -v --tb=short
+
+      - name: Run Integration tests
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_pass@localhost:5432/soc_llm_audit_test
+          REDIS_URL: redis://localhost:6379/0
+        run: pytest tests/test_integration.py -v --tb=short
+
+  # ── Bias Quality Gate ──
+  bias-quality-gate:
+    runs-on: ubuntu-latest
+    needs: backend-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install deps
+        working-directory: backend
+        run: pip install -r requirements.txt
+      - name: Bias Quality Gate
+        working-directory: backend
+        run: |
+          echo "=== BIAS QUALITY GATE ==="
+          echo "Threshold: Adverse Impact Ratio >= 0.8 across all 5 dimensions"
+          pytest tests/test_ethics.py -v --tb=short
+          echo "=== BIAS GATE PASSED ==="
+
+  # ── Frontend Build ──
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Type check
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  # ── Docker Build ──
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [backend-tests, frontend-build, bias-quality-gate]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: docker build -t soc-llm-backend:latest ./backend
+
+      - name: Build frontend image
+        run: docker build -t soc-llm-frontend:latest ./frontend
